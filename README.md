@@ -1,67 +1,42 @@
 # ternary-conv
 
-**Ternary convolution operations for signals and images with {-1, 0, +1} arithmetic.**
+**Convolution where every weight is {-1, 0, +1} — the operation that makes ternary networks see.**
 
 [![crate](https://img.shields.io/badge/crates.io-ternary--conv-orange)](https://crates.io)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-## Overview
+## Why This Exists
 
-`ternary-conv` provides convolution operations designed for ternary-valued signals and images — data where every element is in the set {-1, 0, +1}. This constraint enables efficient, hardware-friendly computation with explicit Z₃ arithmetic throughout.
+Convolution is the backbone of computer vision. It's also where neural networks burn the most compute: every pixel touches every kernel weight, every layer. When you constrain those weights to {-1, 0, +1}, convolution stops being floating-point multiplication and becomes integer sign operations — something a microcontroller can do faster than a GPU does float math.
 
-The crate supports:
+But you can't just round float convolution outputs and call it ternary. The accumulation, the boundary handling, the rounding — they all interact. You need convolution that was *born* ternary.
 
-| Operation | Description |
-|-----------|-------------|
-| **1D Convolution** | Same-mode with zero-padding |
-| **2D Convolution** | Image/signal filtering with arbitrary kernels |
-| **Dilated Convolution** | Atrous convolution with configurable dilation rate |
-| **Depthwise Separable** | Spatial + pointwise factorization |
-| **Preset Kernels** | Edge detect, blur, sharpen, emboss — all ternary |
+## The Key Insight
 
-## Why Ternary Convolution?
+A ternary convolution kernel multiplies each element by {-1, 0, or +1}. In hardware, that's a sign flip, a zero, or a pass-through — no multiplier needed. The accumulation is just integer addition. The final rounding (back to a trit) is a sign check. The entire operation is:
 
-Ternary convolution is central to **Quantized Neural Networks (QNNs)** where weights and activations are constrained to {-1, 0, +1}. Benefits include:
-
-- **Memory efficiency**: 2 bits per weight vs 32 for float32 — a 16× reduction
-- **Compute efficiency**: Ternary multiplications reduce to lookup tables or XNOR+popcount
-- **Hardware friendly**: No floating-point units needed; suitable for edge/FPGA deployment
-- **Surprisingly effective**: Networks like TWN (Ternary Weight Networks) lose only 1-3% accuracy vs full precision
-
-Beyond neural networks, ternary convolution appears in:
-- **Digital signal processing** with quantized filters
-- **Cellular automata** and discrete dynamical systems
-- **Image processing** with simplified kernel operations
-- **Mathematical morphology** on ternary-valued images
-
-## Z₃ Arithmetic
-
-All element-wise operations use explicit match arms — no modular arithmetic shortcuts:
-
-```rust
-pub fn trit_mul(a: i8, b: i8) -> i8 {
-    match (a, b) {
-        (-1, -1) =>  1,  (-1, 0) =>  0,  (-1, 1) => -1,
-        ( 0, -1) =>  0,  ( 0, 0) =>  0,  ( 0, 1) =>  0,
-        ( 1, -1) => -1,  ( 1, 0) =>  0,  ( 1, 1) =>  1,
-        _ => unreachable!(),
-    }
-}
+```
+output[i,j] = sign(Σ kernel[k,l] × input[i+k, j+l])
 ```
 
-The convolution accumulates products in regular integers and rounds the result back to the nearest trit: negative → -1, zero → 0, positive → 1.
+Where every `×` is a trit multiplication (9 cases, compiler-visible) and `sign` maps to {-1, 0, +1}. No floating point anywhere in the pipeline.
 
 ## Quick Start
+
+```toml
+[dependencies]
+ternary-conv = "0.1"
+```
 
 ```rust
 use ternary_conv::*;
 
-// 1D convolution
+// 1D convolution — signal processing
 let signal = vec![1, 1, -1, 0, 1, -1];
-let kernel = vec![1, 0, -1]; // simple difference detector
+let kernel = vec![1, 0, -1]; // difference detector
 let output = conv1d(&signal, &kernel);
 
-// 2D convolution with a ternary image
+// 2D convolution — image filtering
 let image = TernaryMatrix::from_vec(5, 5, vec![
      1,  1,  1,  1,  1,
      1,  0,  0,  0,  1,
@@ -70,79 +45,169 @@ let image = TernaryMatrix::from_vec(5, 5, vec![
      1,  1,  1,  1,  1,
 ]);
 
-// Edge detection
-let edges = conv2d(&image, &kernel_edge_detect());
-
-// Blur
-let blurred = conv2d(&image, &kernel_blur());
-
-// Sharpen
-let sharp = conv2d(&image, &kernel_sharpen());
-
-// Emboss (3D-like effect)
+let edges    = conv2d(&image, &kernel_edge_detect());
+let blurred  = conv2d(&image, &kernel_blur());
+let sharp    = conv2d(&image, &kernel_sharpen());
 let embossed = conv2d(&image, &kernel_emboss());
 
-// Dilated convolution (atrous)
+// Dilated (atrous) convolution — larger receptive field, same parameters
 let dilated = conv2d_dilated(&image, &kernel_edge_detect(), 2);
 
-// Depthwise separable convolution
+// Depthwise separable — mobile-friendly factorization
 let depth = kernel_blur();
-let point = TernaryMatrix::from_vec(1, 1, vec![1]); // identity pointwise
+let point = TernaryMatrix::from_vec(1, 1, vec![1]);
 let sep = depthwise_separable_conv2d(&image, &depth, &point);
 ```
 
-## Operation Details
-
-### 1D Convolution
-
-Computes same-mode convolution: the output has the same length as the input. Zero-padding is applied at boundaries. The kernel is centered at each position.
+## Architecture
 
 ```
-output[i] = round_to_trit(Σ signal[i+p-pad] × kernel[p])
+               ┌──────────────────┐
+               │  TernaryMatrix   │  (row-major, i8, {-1, 0, +1})
+               └────────┬─────────┘
+                        │
+          ┌─────────────┼──────────────┐
+          │             │              │
+    ┌─────▼─────┐ ┌────▼──────┐ ┌────▼──────────┐
+    │  conv1d   │ │  conv2d   │ │  conv2d_       │
+    │  (same)   │ │  (same)   │ │  dilated       │
+    └───────────┘ └────┬──────┘ └───────────────┘
+                       │
+                ┌──────▼──────────┐
+                │ depthwise_      │
+                │ separable_conv2d│
+                │ (spatial + 1×1) │
+                └─────────────────┘
 ```
 
-### 2D Convolution
+| Operation | Input | Output | Use Case |
+|-----------|-------|--------|----------|
+| `conv1d` | Signal + kernel | Same-length signal | Time series, NLP |
+| `conv2d` | Image + kernel | Same-size image | Vision, feature extraction |
+| `conv2d_dilated` | Image + kernel + dilation | Same-size image | Segmentation, multi-scale |
+| `depthwise_separable_conv2d` | Image + spatial + pointwise | Same-size image | Mobile inference |
 
-Standard 2D convolution with zero-padding (same-mode). Supports arbitrary kernel sizes. For a kernel of size (kh, kw), the padding is (kh/2, kw/2).
+## Preset Kernels
 
-### Dilated Convolution
+All kernels are valid ternary matrices — no floating-point coefficients:
 
-Also known as *atrous convolution*, this inserts `dilation - 1` zeros between kernel elements, effectively increasing the receptive field without increasing the parameter count. A dilation of 1 is standard convolution.
-
-This is particularly useful in:
-- **Semantic segmentation** (DeepLab-style architectures)
-- **Multi-scale feature extraction** without pooling
-- **Ternary CNNs** where larger receptive fields are needed cheaply
-
-### Depthwise Separable Convolution
-
-Factorizes a standard convolution into:
-1. **Depthwise**: spatial convolution applied per channel
-2. **Pointwise**: 1×1 convolution across channels
-
-This reduces the parameter count from `k² × C_in × C_out` to `k² × C_in + C_in × C_out`. In the ternary case, the pointwise convolution is simply a Z₃ scalar multiplication.
-
-### Preset Kernels
-
-All kernels are valid ternary matrices:
-
-| Kernel | Pattern | Use |
-|--------|---------|-----|
-| **Edge Detect** | Horizontal Prewit-like | Detect horizontal edges |
-| **Blur** | Cross-shaped averaging | Smooth while preserving ternary values |
-| **Sharpen** | Laplacian-like | Enhance edges and details |
-| **Emboss** | Diagonal difference | Create 3D relief effect |
+| Kernel | 3×3 Pattern | Effect |
+|--------|------------|--------|
+| **Edge Detect** | Prewit-like horizontal gradient | Detect edges |
+| **Blur** | Cross-shaped averaging | Smooth, preserve ternary |
+| **Sharpen** | Laplacian-like | Enhance details |
+| **Emboss** | Diagonal difference | 3D relief effect |
 | **Identity** | 1×1 pass-through | No-op verification |
+
+```rust
+let k = kernel_edge_detect();
+//  1  1  1
+//  0  0  0
+// -1 -1 -1
+```
 
 ## Accumulation and Rounding
 
-Since ternary products are in {-1, 0, +1} but the sum of many products can be arbitrarily large, the crate uses a simple rounding rule:
+Ternary products are in {-1, 0, +1}, but their sum can be arbitrarily large. The rounding rule is:
 
-- Sum < 0 → **-1**
-- Sum = 0 → **0**
-- Sum > 0 → **+1**
+```
+sum < 0 → -1    sum = 0 → 0    sum > 0 → +1
+```
 
-This is the ternary analog of the sign function and preserves the algebraic structure while being computationally trivial.
+This is the ternary sign function. It's the natural projection from ℤ back to Z₃, and it's computationally trivial: one comparison.
+
+**Why not modular arithmetic?** Because we're accumulating *integer sums* of trit products, not operating in Z₃ directly. The sum carries meaningful magnitude information that modular arithmetic would destroy. Sign rounding preserves the direction while discarding magnitude — exactly what you want for a ternary output.
+
+## API Reference
+
+### Core Types
+
+```rust
+struct TernaryMatrix {
+    // Row-major, elements are i8 in {-1, 0, +1}
+}
+
+impl TernaryMatrix {
+    fn zeros(rows: usize, cols: usize) -> Self;
+    fn from_vec(rows: usize, cols: usize, data: Vec<i8>) -> Self;
+    fn get(&self, r: usize, c: usize) -> i8;
+    fn set(&mut self, r: usize, c: usize, v: i8);
+    fn rows(&self) -> usize;
+    fn cols(&self) -> usize;
+}
+```
+
+### Convolution Operations
+
+```rust
+fn conv1d(signal: &[i8], kernel: &[i8]) -> Vec<i8>;
+fn conv2d(input: &TernaryMatrix, kernel: &TernaryMatrix) -> TernaryMatrix;
+fn conv2d_dilated(input: &TernaryMatrix, kernel: &TernaryMatrix, dilation: usize) -> TernaryMatrix;
+fn depthwise_separable_conv2d(
+    input: &TernaryMatrix,
+    depth_kernel: &TernaryMatrix,
+    point_kernel: &TernaryMatrix,  // must be 1×1
+) -> TernaryMatrix;
+```
+
+### Preset Kernels
+
+```rust
+fn kernel_edge_detect() -> TernaryMatrix;
+fn kernel_blur() -> TernaryMatrix;
+fn kernel_sharpen() -> TernaryMatrix;
+fn kernel_emboss() -> TernaryMatrix;
+fn kernel_identity() -> TernaryMatrix;
+```
+
+### Arithmetic
+
+```rust
+fn trit_mul(a: i8, b: i8) -> i8;  // Z₃ multiplication via match
+```
+
+## Real-World Example: Ternary Edge Detection on a Satellite
+
+A low-earth-orbit satellite captures 50-megapixel images and needs to detect coastline edges in real-time to trigger high-resolution capture. The downlink bandwidth is limited — processing must happen on-board.
+
+Traditional approach: float32 Sobel filter → 200 MB/s bandwidth for the raw image → 800 MB/s for the filter kernels → power budget exceeded.
+
+Ternary approach: quantize image to {-1, 0, +1} (dark/neutral/bright) → apply `kernel_edge_detect()` → 6.25 MB/s bandwidth (16× less) → runs on a radiation-hardened microcontroller drawing 50 mW.
+
+```rust
+// On-board processing
+let quantized = ternarize_satellite_image(&raw_image);
+let edges = conv2d(&quantized, &kernel_edge_detect());
+let coastline_pixels = count_nonzero(&edges);
+if coastline_pixels > threshold {
+    trigger_high_res_capture();
+}
+```
+
+## Performance Characteristics
+
+- **conv1d**: O(signal_len × kernel_len) — each output is a dot product of length k
+- **conv2d**: O(H × W × kH × kW) — four nested loops, same-mode with zero padding
+- **Dilated**: Same complexity, larger effective receptive field: `k_eff = k + (k-1) × (dilation-1)`
+- **Depthwise separable**: Reduces from O(k² × C²) to O(k² × C + C²) — dramatic savings for multi-channel
+
+Memory: O(H × W) for the input and output matrices. Kernels are tiny (typically 3×3 = 9 bytes). No scratch space needed beyond the output.
+
+## Ecosystem Connections
+
+This crate operates on `TernaryMatrix` and produces outputs for downstream layers:
+
+- [`ternary-matmul`](https://github.com/SuperInstance/ternary-matmul) — the matmul engine (fully-connected layers)
+- [`ternary-pool`](https://github.com/SuperInstance/ternary-pool) — downsampling after convolution
+- [`ternary-norm`](https://github.com/SuperInstance/ternary-norm) — normalize feature maps
+- [`ternary-activation`](https://github.com/SuperInstance/ternary-activation) — non-linearities between conv layers
+- [`ternary-kernel-launch`](https://github.com/SuperInstance/ternary-kernel-launch) — dispatch these ops to GPU
+
+## Open Questions
+
+- **Winograd for ternary**: Winograd's algorithm reduces the number of multiplications for small fixed kernels (3×3 → 2×2). Since ternary "multiplications" are already nearly free, the win is marginal — but the reduced accumulation count still helps.
+- **Im2col + GEMM decomposition**: Standard CNN implementations reshape convolution into matrix multiplication. Combined with `ternary-matmul`'s XNOR path, this could be very fast for binary-ternary filters.
+- **3D convolution**: Video and volumetric data need 3D kernels. The current API is 1D and 2D only.
 
 ## Testing
 
@@ -150,24 +215,7 @@ This is the ternary analog of the sign function and preserves the algebraic stru
 cargo test
 ```
 
-The test suite covers:
-- Exhaustive trit multiplication verification
-- 1D basic convolution and identity kernel preservation
-- 2D identity kernel pass-through
-- Edge detection produces expected directional responses
-- Dilation correctly skips positions and produces different results
-- Depthwise separable matches standard convolution with identity pointwise
-- Kernel application correctness on known inputs
-- All preset kernels contain only valid trits
-
-## Use in Research
-
-If you use this crate in academic work, the key design choices to cite are:
-
-1. **Ternary Weight Networks** (Li et al., 2016) — {-1, 0, +1} quantization
-2. **Trained Ternary Quantization** (Zhu et al., 2016) — learned ternary weights
-3. **XNOR-Net** (Rastegari et al., 2016) — binary/ternary fast paths
-4. **Atrous convolution** (Chen et al., 2017) — dilated convolution for segmentation
+Covers: exhaustive trit multiplication, 1D identity preservation, 2D identity pass-through, edge detection directional responses, dilation correctness, depthwise separable equivalence with identity pointwise, kernel application on known inputs, all kernels are valid ternary, and Display formatting.
 
 ## License
 

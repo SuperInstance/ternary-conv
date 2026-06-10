@@ -1,4 +1,6 @@
 [package]
+description = "ternary-conv - SuperInstance ecosystem crate"
+repository = "https://github.com/SuperInstance/ternary-conv"
 name = "ternary-conv"
 version = "0.1.0"
 edition = "2024"
